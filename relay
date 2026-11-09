@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# Командная строка Multi-Exit Relay: status, list, check, backup, restore,
+# add, remove, change-ip, apply, uninstall, help.
+set -Eeuo pipefail
+
+_mex_source="${BASH_SOURCE[0]}"
+while [[ -L "$_mex_source" ]]; do
+  _mex_link_dir="$(cd -P "$(dirname "$_mex_source")" && pwd)"
+  _mex_source="$(readlink "$_mex_source")"
+  [[ "$_mex_source" != /* ]] && _mex_source="${_mex_link_dir}/${_mex_source}"
+done
+_mex_dir="$(cd -P "$(dirname "$_mex_source")" && pwd)"
+export MEX_SOURCE_DIR="$_mex_dir"
+
+# shellcheck source=lib/common.sh
+source "${_mex_dir}/lib/common.sh"
+# shellcheck source=lib/validation.sh
+source "${_mex_dir}/lib/validation.sh"
+# shellcheck source=lib/ports.sh
+source "${_mex_dir}/lib/ports.sh"
+# shellcheck source=lib/iptables.sh
+source "${_mex_dir}/lib/iptables.sh"
+# shellcheck source=lib/backup.sh
+source "${_mex_dir}/lib/backup.sh"
+# shellcheck source=lib/exits.sh
+source "${_mex_dir}/lib/exits.sh"
+# shellcheck source=lib/diagnostics.sh
+source "${_mex_dir}/lib/diagnostics.sh"
+
+mex_init
+
+mex_usage() {
+  cat <<EOF
+Multi-Exit Relay ${MEX_VERSION}
+TCP-проброс с Relay на несколько Exit (VLESS + REALITY + TCP). Xray на Relay не ставится.
+
+Использование:
+  relay status
+  relay list
+  relay check
+  relay backup
+  relay restore --backup КАТАЛОГ [--yes]
+  relay add --name ИМЯ --ip IP [--relay-port-443 N --relay-port-8443 M] [--force]
+  relay remove --id exit-N [--yes]
+  relay change-ip --id exit-N --ip IP [--force] [--yes]
+  relay apply
+  relay uninstall [--yes] [--purge-config]
+  relay help
+  relay version
+
+Порты Exit на дальней стороне всегда 443 и 8443.
+Внешние порты Relay по умолчанию: 443/8443, 10443/18443, 20443/28443 и далее.
+Занятый порт не перезаписывается. SNI не меняется. UDP не пробрасывается.
+
+relay check проверяет TCP-порты, DNAT, FORWARD, MASQUERADE, ip_forward,
+netfilter-persistent и конфликты портов. Это не проверка REALITY или VPN.
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || "${1:-}" == "help" || $# -eq 0 ]]; then
+  mex_usage
+  exit 0
+fi
+
+if [[ "${1:-}" == "--version" || "${1:-}" == "version" ]]; then
+  printf '%s\n' "multi-exit-relay ${MEX_VERSION}"
+  exit 0
+fi
+
+trap 'mex_on_err $LINENO $?' ERR
+
+cmd="${1}"
+shift
+
+case "$cmd" in
+  status)
+    if [[ ! -f "$MEX_CONFIG_FILE" ]]; then
+      printf '%s\n' "Multi-Exit Relay не настроен (${MEX_CONFIG_FILE} отсутствует)."
+      exit 0
+    fi
+    pub="$(jq -r '.public_ip // "не задан"' "$MEX_CONFIG_FILE")"
+    iface="$(jq -r '.egress_interface // "не задан"' "$MEX_CONFIG_FILE")"
+    count="$(jq -r '.exits | length' "$MEX_CONFIG_FILE")"
+    printf 'Версия: %s\n' "$MEX_VERSION"
+    printf 'Конфигурация: %s\n' "$MEX_CONFIG_FILE"
+    printf 'Публичный IP: %s\n' "$pub"
+    printf 'Интерфейс: %s\n' "$iface"
+    printf 'Exit: %s\n' "$count"
+    printf 'ip_forward: %s\n' "$(mex_read_ip_forward)"
+    ;;
+  list)
+    mex_exit_print_table
+    ;;
+  check)
+    mex_diag_check
+    ;;
+  backup|save)
+    mex_acquire_lock || exit 1
+    mex_backup_create "manual"
+    ;;
+  restore)
+    mex_parse_common_flags "$@" || exit 1
+    if [[ -z "$MEX_OPT_BACKUP" ]]; then
+      if [[ -t 0 ]]; then
+        mex_wizard_restore || exit 1
+      else
+        mex_fail "Укажите --backup КАТАЛОГ." || true
+        exit 1
+      fi
+    else
+      mex_confirm "Восстановить правила Multi-Exit Relay из ${MEX_OPT_BACKUP}? Весь файрвол из снимка не заливается." || exit 1
+      mex_backup_restore "$MEX_OPT_BACKUP" || exit 1
+    fi
+    ;;
+  add)
+    mex_parse_common_flags "$@" || exit 1
+    if [[ -z "$MEX_OPT_NAME" || -z "$MEX_OPT_IP" ]]; then
+      if [[ -t 0 ]]; then
+        mex_wizard_add_one || exit 1
+      else
+        mex_fail "Укажите --name и --ip." || true
+        exit 1
+      fi
+    else
+      mex_exit_add "$MEX_OPT_NAME" "$MEX_OPT_IP" "$MEX_OPT_P1" "$MEX_OPT_P2" "$MEX_OPT_FORCE" || exit 1
+    fi
+    ;;
+  remove|rm)
+    mex_parse_common_flags "$@" || exit 1
+    if [[ -z "$MEX_OPT_ID" ]]; then
+      if [[ -t 0 ]]; then
+        mex_wizard_remove || exit 1
+      else
+        mex_fail "Укажите --id exit-N." || true
+        exit 1
+      fi
+    else
+      mex_confirm "Удалить только Exit ${MEX_OPT_ID}? Остальные Exit и чужие правила не изменятся." || exit 1
+      mex_exit_remove "$MEX_OPT_ID" || exit 1
+    fi
+    ;;
+  change-ip)
+    mex_parse_common_flags "$@" || exit 1
+    if [[ -z "$MEX_OPT_ID" || -z "$MEX_OPT_IP" ]]; then
+      if [[ -t 0 ]]; then
+        mex_wizard_change_ip || exit 1
+      else
+        mex_fail "Укажите --id и --ip." || true
+        exit 1
+      fi
+    else
+      mex_confirm "Сменить IP ${MEX_OPT_ID} на ${MEX_OPT_IP} и сохранить порты?" || exit 1
+      mex_exit_change_ip "$MEX_OPT_ID" "$MEX_OPT_IP" "$MEX_OPT_FORCE" || exit 1
+    fi
+    ;;
+  apply)
+    mex_apply_from_config
+    ;;
+  uninstall)
+    mex_parse_common_flags "$@" || exit 1
+    mex_warn "Будут удалены только объекты Multi-Exit Relay."
+    mex_confirm "Продолжить удаление?" || exit 1
+    mex_uninstall_system || exit 1
+    if mex_confirm_config_delete; then
+      mex_uninstall_config_files
+    else
+      mex_info "Конфигурация сохранена. Резервные копии: ${MEX_BACKUP_DIR}."
+    fi
+    ;;
+  *)
+    mex_fail "Неизвестная команда: ${cmd}" || true
+    mex_usage >&2
+    exit 1
+    ;;
+esac
