@@ -32,28 +32,30 @@ mex_init
 mex_usage() {
   cat <<EOF
 Multi-Exit Relay ${MEX_VERSION}
-TCP-проброс с Relay на несколько Exit (VLESS + REALITY + TCP). Xray на Relay не ставится.
+Проброс TCP и UDP с Relay на несколько Exit. Xray на Relay не ставится.
 
 Использование:
-  relay status
+  relay status [--json]
   relay list
-  relay check
+  relay check [--json]
   relay backup
   relay restore --backup КАТАЛОГ [--yes]
   relay add --name ИМЯ --ip IP [--relay-port-443 N --relay-port-8443 M] [--force]
-  relay remove --id exit-N [--yes]
-  relay change-ip --id exit-N --ip IP [--force] [--yes]
-  relay apply
+  relay remove --id ID [--yes]
+  relay change-ip --id ID --ip IP [--force] [--yes]
+  relay apply [--config FILE] [--json]
   relay uninstall [--yes] [--purge-config]
   relay help
-  relay version
+  relay version [--json]
 
-Порты Exit на дальней стороне всегда 443 и 8443.
-Внешние порты Relay по умолчанию: 443/8443, 10443/18443, 20443/28443 и далее.
-Занятый порт не перезаписывается. SNI не меняется. UDP не пробрасывается.
+Схема конфигурации v2: exits[].host и forwards[] с proto tcp|udp, listen и target.
+Меню и relay add по-прежнему создают пару TCP 443/8443. Остальные порты и UDP
+записываются в config.json и применяются командой relay apply.
+SNI не меняется. Чужие правила, SSH и UFW не трогаются.
 
-relay check проверяет TCP-порты, DNAT, FORWARD, MASQUERADE, ip_forward,
-netfilter-persistent и конфликты портов. Это не проверка REALITY или VPN.
+Коды выхода: 0 успех, 1 неверные аргументы, 2 конфигурация,
+3 сбой применения или зависимостей, 4 проверка нашла проблемы, 5 занята блокировка.
+С --json на stdout только JSON, сообщения — на stderr.
 EOF
 }
 
@@ -63,6 +65,22 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || "${1:-}" == "help" || $# -eq 0
 fi
 
 if [[ "${1:-}" == "--version" || "${1:-}" == "version" ]]; then
+  if [[ "${2:-}" == "--json" ]]; then
+    if [[ -n "${3:-}" ]]; then
+      printf '%s\n' "Ошибка: неизвестный аргумент: $3" >&2
+      exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+      printf '%s\n' "Ошибка: для --json нужна утилита jq." >&2
+      exit 3
+    fi
+    jq -n --arg version "$MEX_VERSION" '{ok: true, name: "multi-exit-relay", version: $version}'
+    exit 0
+  fi
+  if [[ -n "${2:-}" ]]; then
+    printf '%s\n' "Ошибка: неизвестный аргумент: $2" >&2
+    exit 1
+  fi
   printf '%s\n' "multi-exit-relay ${MEX_VERSION}"
   exit 0
 fi
@@ -72,27 +90,62 @@ trap 'mex_on_err $LINENO $?' ERR
 cmd="${1}"
 shift
 
+mex_reject_unknown() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) ;;
+      *)
+        printf '%s\n' "Ошибка: неизвестный аргумент: $1" >&2
+        return 1
+        ;;
+    esac
+    shift
+  done
+}
+
 case "$cmd" in
   status)
+    mex_reject_unknown "$@" || exit 1
+    if [[ " ${*} " == *" --json "* ]]; then
+      MEX_JSON=1
+      MEX_JSON_COMMAND=status
+      rc=0
+      mex_collect_report status || rc=$?
+      exit "$rc"
+    fi
     if [[ ! -f "$MEX_CONFIG_FILE" ]]; then
-      printf '%s\n' "Multi-Exit Relay не настроен (${MEX_CONFIG_FILE} отсутствует)."
-      exit 0
+      printf '%s\n' "Multi-Exit Relay не настроен (${MEX_CONFIG_FILE} отсутствует)." >&2
+      exit 2
+    fi
+    if ! mex_config_validate_file "$MEX_CONFIG_FILE"; then
+      printf '%s\n' "Ошибка: конфигурация не прошла проверку." >&2
+      exit 2
     fi
     pub="$(jq -r '.public_ip // "не задан"' "$MEX_CONFIG_FILE")"
     iface="$(jq -r '.egress_interface // "не задан"' "$MEX_CONFIG_FILE")"
     count="$(jq -r '.exits | length' "$MEX_CONFIG_FILE")"
+    forwards="$(jq -r 'if .version == 1 then (.exits | length) * 2 else ([.exits[].forwards[]?] | length) end' "$MEX_CONFIG_FILE")"
     printf 'Версия: %s\n' "$MEX_VERSION"
+    printf 'Схема: %s\n' "$(jq -r '.version' "$MEX_CONFIG_FILE")"
     printf 'Конфигурация: %s\n' "$MEX_CONFIG_FILE"
     printf 'Публичный IP: %s\n' "$pub"
     printf 'Интерфейс: %s\n' "$iface"
     printf 'Exit: %s\n' "$count"
+    printf 'Пробросы: %s\n' "$forwards"
     printf 'ip_forward: %s\n' "$(mex_read_ip_forward)"
     ;;
   list)
     mex_exit_print_table
     ;;
   check)
-    mex_diag_check
+    mex_reject_unknown "$@" || exit 1
+    if [[ " ${*} " == *" --json "* ]]; then
+      MEX_JSON=1
+      MEX_JSON_COMMAND=check
+    fi
+    rc=0
+    mex_diag_check || rc=$?
+    exit "$rc"
     ;;
   backup|save)
     mex_acquire_lock || exit 1
@@ -154,7 +207,10 @@ case "$cmd" in
     fi
     ;;
   apply)
-    mex_apply_from_config
+    mex_parse_common_flags "$@" || exit 1
+    rc=0
+    mex_apply_from_config || rc=$?
+    exit "$rc"
     ;;
   uninstall)
     mex_parse_common_flags "$@" || exit 1

@@ -55,7 +55,7 @@ mex_backup_create() {
   if [[ -f "$MEX_CONFIG_FILE" ]]; then
     cp -a "$MEX_CONFIG_FILE" "$dir/config.json"
   else
-    printf '%s\n' '{"version":1,"exits":[]}' >"$dir/config.json"
+    printf '%s\n' '{"version":2,"exits":[]}' >"$dir/config.json"
   fi
   if [[ -f "$MEX_STATE_FILE" ]]; then
     cp -a "$MEX_STATE_FILE" "$dir/state.json"

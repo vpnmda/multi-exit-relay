@@ -1,33 +1,31 @@
 {
-  "version": 1,
+  "version": 2,
   "public_ip": "203.0.113.5",
   "egress_interface": "eth0",
   "created_at": "2026-11-09T00:00:00Z",
   "next_seq": 3,
   "exits": [
     {
-      "id": "exit-1",
+      "id": "de-1",
       "name": "Германия",
-      "ip": "203.0.113.10",
-      "relay_port_443": 443,
-      "relay_port_8443": 8443,
-      "exit_port_443": 443,
-      "exit_port_8443": 8443,
-      "status": "active",
-      "added_at": "2026-11-09T00:00:00Z",
-      "tcp_check_forced": false
+      "host": "203.0.113.10",
+      "forwards": [
+        {"proto": "tcp", "listen": 443, "target": 443},
+        {"proto": "tcp", "listen": 8443, "target": 8443},
+        {"proto": "udp", "listen": 443, "target": 443},
+        {"proto": "tcp", "listen": 4443, "target": 4443},
+        {"proto": "tcp", "listen": 6443, "target": 6443}
+      ]
     },
     {
-      "id": "exit-2",
+      "id": "nl-1",
       "name": "Нидерланды",
-      "ip": "203.0.113.20",
-      "relay_port_443": 10443,
-      "relay_port_8443": 18443,
-      "exit_port_443": 443,
-      "exit_port_8443": 8443,
-      "status": "active",
-      "added_at": "2026-11-09T00:00:00Z",
-      "tcp_check_forced": false
+      "host": "exit.nl.example",
+      "forwards": [
+        {"proto": "tcp", "listen": 10443, "target": 443},
+        {"proto": "tcp", "listen": 18443, "target": 8443},
+        {"proto": "udp", "listen": 10443, "target": 443}
+      ]
     }
   ]
 }

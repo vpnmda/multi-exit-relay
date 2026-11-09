@@ -23,7 +23,7 @@ PIDS="${BASE}/pids"
 
 if [[ "${1:-}" == "--inside" ]]; then
   shift
-  export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+  export PATH="${MEX_E2E_BASE:+${MEX_E2E_BASE}/bin:}/usr/sbin:/usr/bin:/sbin:/bin"
   export MEX_CONFIG_DIR="$CFG"
   export MEX_CONFIG_FILE="${CFG}/config.json"
   export MEX_STATE_FILE="${CFG}/state.json"
@@ -71,7 +71,7 @@ if [[ "${1:-}" == "--inside" ]]; then
       ;;
     add-conflict)
       mex_exit_add "Германия" "10.2.0.2"
-      jq -r '.exits[0] | "\(.relay_port_443) \(.relay_port_8443)"' "$MEX_CONFIG_FILE"
+      jq -r '.exits[0].forwards | map(select(.proto=="tcp").listen) | "\(.[0]) \(.[1])"' "$MEX_CONFIG_FILE"
       ;;
     remove-conflict)
       id="$(jq -r '.exits[0].id' "$MEX_CONFIG_FILE")"
@@ -80,7 +80,19 @@ if [[ "${1:-}" == "--inside" ]]; then
     add-two)
       mex_exit_add "Германия" "10.2.0.2"
       mex_exit_add "Нидерланды" "10.3.0.2"
-      jq -r '.exits[] | [.id, .ip, .relay_port_443, .relay_port_8443] | @tsv' "$MEX_CONFIG_FILE"
+      jq -r '.exits[] | [.id, .host, (.forwards[0].listen|tostring), (.forwards[1].listen|tostring)] | @tsv' "$MEX_CONFIG_FILE"
+      ;;
+    apply-config)
+      MEX_OPT_CONFIG="${1:-}"
+      mex_apply_from_config
+      ;;
+    dnat-pkts)
+      iptables -t nat -L MEX_PREROUTING -n -v -x | awk '/tcp dpt:443 / { print $1; exit }'
+      ;;
+    save-own)
+      iptables -t nat -S MEX_PREROUTING
+      iptables -t nat -S MEX_POSTROUTING
+      iptables -S MEX_FORWARD
       ;;
     add-four-more)
       MEX_ASSUME_ROUTE=1 mex_exit_add "Финляндия" "203.0.113.11" "" "" 1
@@ -153,20 +165,32 @@ fi
 mkdir -p "$CFG" "${CFG}/logs" "$BASE"
 cat >"$PY" <<'PY'
 import socket, sys
-ident, port = sys.argv[1], int(sys.argv[2])
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(("0.0.0.0", port))
-s.listen(32)
-while True:
-    c, _ = s.accept()
-    try:
-        c.sendall((ident + "\n").encode())
-        c.shutdown(socket.SHUT_WR)
-    except OSError:
-        pass
-    finally:
-        c.close()
+kind, ident, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+if kind == "tcp":
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", port))
+    s.listen(32)
+    while True:
+        c, _ = s.accept()
+        try:
+            c.sendall((ident + "\n").encode())
+            c.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        finally:
+            c.close()
+elif kind == "udp":
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("0.0.0.0", port))
+    while True:
+        data, addr = s.recvfrom(4096)
+        if not data:
+            continue
+        s.sendto((ident + "\n").encode(), addr)
+else:
+    sys.stderr.write("unknown kind\n")
+    sys.exit(2)
 PY
 
 cleanup() {
@@ -235,16 +259,25 @@ for dev in all default vr-c vr-e1 vr-e2 lo; do
 done
 
 start_listener() {
-  local ns="$1" ident="$2" port="$3"
-  ip netns exec "$ns" python3 "$PY" "$ident" "$port" >"${BASE}/${ns}-${port}.log" 2>&1 &
+  local ns="$1" kind="$2" ident="$3" port="$4"
+  ip netns exec "$ns" python3 "$PY" "$kind" "$ident" "$port" >"${BASE}/${ns}-${kind}-${port}.log" 2>&1 &
   echo $! >>"$PIDS"
 }
 
-start_listener mex-exit1 exit1-443 443
-start_listener mex-exit1 exit1-8443 8443
-start_listener mex-exit2 exit2-443 443
-start_listener mex-exit2 exit2-8443 8443
-start_listener mex-relay relay-hold 443
+start_exit_listeners() {
+  start_listener mex-exit1 tcp exit1-443 443
+  start_listener mex-exit1 tcp exit1-8443 8443
+  start_listener mex-exit1 tcp exit1-4443 4443
+  start_listener mex-exit1 udp exit1-udp-443 443
+  start_listener mex-exit2 tcp exit2-443 443
+  start_listener mex-exit2 tcp exit2-8443 8443
+  start_listener mex-exit2 udp exit2-udp-443 443
+  start_listener mex-exit2 tcp exit2-6443 6443
+  start_listener mex-exit2 udp exit2-udp-8443 8443
+}
+
+start_exit_listeners
+start_listener mex-relay tcp relay-hold 443
 sleep 0.4
 
 ip netns exec mex-relay timeout 3 bash -c 'echo >/dev/tcp/10.2.0.2/443' || {
@@ -252,10 +285,23 @@ ip netns exec mex-relay timeout 3 bash -c 'echo >/dev/tcp/10.2.0.2/443' || {
   exit 1
 }
 
+mkdir -p "${BASE}/bin"
+cat >"${BASE}/bin/getent" <<'EOF'
+#!/bin/bash
+if [[ "$1" == "ahostsv4" && -n "${MEX_HOSTS_MAP:-}" && -f "$MEX_HOSTS_MAP" ]]; then
+  awk -v h="$2" '$1 == h { for (i = 2; i <= NF; i++) print $i, "STREAM", h }' "$MEX_HOSTS_MAP"
+  exit 0
+fi
+exec /usr/bin/getent "$@"
+EOF
+chmod 755 "${BASE}/bin/getent"
+printf '%s\n' "exit.example.test 10.2.0.2" >"${BASE}/hosts.map"
+
 inside() {
   ip netns exec mex-relay env \
-    PATH="/usr/sbin:/usr/bin:/sbin:/bin" \
+    PATH="${BASE}/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     MEX_E2E_BASE="$BASE" \
+    MEX_HOSTS_MAP="${BASE}/hosts.map" \
     bash "$0" --inside "$@"
 }
 
@@ -276,10 +322,7 @@ if [[ -f "$PIDS" ]]; then
 fi
 ip netns pids mex-relay | xargs -r kill 2>/dev/null || true
 sleep 0.2
-start_listener mex-exit1 exit1-443 443
-start_listener mex-exit1 exit1-8443 8443
-start_listener mex-exit2 exit2-443 443
-start_listener mex-exit2 exit2-8443 8443
+start_exit_listeners
 sleep 0.3
 
 mapfile -t rows < <(inside add-two)
@@ -395,6 +438,137 @@ ip netns exec mex-relay iptables-restore <"${BASE}/rules-before-wipe.v4"
 ip netns exec mex-relay iptables -S INPUT | grep -q foreign-ssh
 ip netns exec mex-relay iptables -t nat -S MEX_PREROUTING >/dev/null
 inside uninstall
+
+# v2: UDP, произвольные порты, несколько Exit, идемпотентность, удаление, домен.
+cat >"${CFG}/v2.json" <<'JSON'
+{
+  "version": 2,
+  "public_ip": "10.1.0.1",
+  "egress_interface": "vr-e1",
+  "exits": [
+    {
+      "id": "exit-a",
+      "name": "A",
+      "host": "10.2.0.2",
+      "forwards": [
+        {"proto": "tcp", "listen": 443, "target": 443},
+        {"proto": "tcp", "listen": 8443, "target": 8443},
+        {"proto": "tcp", "listen": 4443, "target": 4443},
+        {"proto": "udp", "listen": 443, "target": 443}
+      ]
+    },
+    {
+      "id": "exit-b",
+      "name": "B",
+      "host": "10.3.0.2",
+      "forwards": [
+        {"proto": "tcp", "listen": 10443, "target": 443},
+        {"proto": "tcp", "listen": 6443, "target": 6443},
+        {"proto": "udp", "listen": 18443, "target": 8443}
+      ]
+    }
+  ]
+}
+JSON
+inside apply-config "${CFG}/v2.json"
+got="$(client_fetch 443)"
+[[ "$got" == "exit1-443" ]] || { printf 'FAIL: v2 tcp 443 вернул [%s]\n' "$got" >&2; exit 1; }
+got="$(client_fetch 4443)"
+[[ "$got" == "exit1-4443" ]] || { printf 'FAIL: v2 tcp 4443 вернул [%s]\n' "$got" >&2; exit 1; }
+got="$(client_fetch 6443)"
+[[ "$got" == "exit2-6443" ]] || { printf 'FAIL: v2 tcp 6443 вернул [%s]\n' "$got" >&2; exit 1; }
+got="$(client_fetch 10443)"
+[[ "$got" == "exit2-443" ]] || { printf 'FAIL: v2 второй Exit tcp вернул [%s]\n' "$got" >&2; exit 1; }
+
+udp_fetch() {
+  local port="$1"
+  ip netns exec mex-client python3 - "$port" <<'PY'
+import socket, sys
+port = int(sys.argv[1])
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(3)
+s.sendto(b"ping", ("10.1.0.1", port))
+data, _ = s.recvfrom(4096)
+sys.stdout.write(data.decode().strip())
+PY
+}
+got="$(udp_fetch 443)"
+[[ "$got" == "exit1-udp-443" ]] || { printf 'FAIL: udp 443 вернул [%s]\n' "$got" >&2; exit 1; }
+got="$(udp_fetch 18443)"
+[[ "$got" == "exit2-udp-8443" ]] || { printf 'FAIL: udp 18443 вернул [%s]\n' "$got" >&2; exit 1; }
+
+pkts_before="$(inside dnat-pkts)"
+[[ "$pkts_before" =~ ^[0-9]+$ && "$pkts_before" -ge 1 ]] || {
+  printf 'FAIL: счётчик DNAT не вырос: [%s]\n' "$pkts_before" >&2
+  exit 1
+}
+rules_before="$(inside save-own)"
+inside apply-config "${CFG}/v2.json"
+rules_after="$(inside save-own)"
+[[ "$rules_before" == "$rules_after" ]] || {
+  printf 'FAIL: повторный apply изменил правила\n' >&2
+  exit 1
+}
+pkts_after="$(inside dnat-pkts)"
+[[ "$pkts_after" -ge "$pkts_before" ]] || {
+  printf 'FAIL: повторный apply обнулил счётчик (%s -> %s)\n' "$pkts_before" "$pkts_after" >&2
+  exit 1
+}
+got="$(client_fetch 4443)"
+[[ "$got" == "exit1-4443" ]] || { printf 'FAIL: после повторного apply 4443 сломался\n' >&2; exit 1; }
+
+jq 'del(.exits[1])' "${CFG}/v2.json" >"${CFG}/v2-one.json"
+inside apply-config "${CFG}/v2-one.json"
+flush_conntrack
+if client_fetch 10443 >/dev/null 2>&1; then
+  printf '%s\n' "FAIL: после удаления exit-b порт 10443 ещё отвечает" >&2
+  exit 1
+fi
+if udp_fetch 18443 >/dev/null 2>&1; then
+  printf '%s\n' "FAIL: после удаления exit-b UDP ещё отвечает" >&2
+  exit 1
+fi
+got="$(client_fetch 443)"
+[[ "$got" == "exit1-443" ]] || { printf 'FAIL: exit-a сломался после удаления exit-b\n' >&2; exit 1; }
+got="$(udp_fetch 443)"
+[[ "$got" == "exit1-udp-443" ]] || { printf 'FAIL: UDP exit-a сломался после удаления exit-b\n' >&2; exit 1; }
+
+cat >"${CFG}/domain.json" <<'JSON'
+{
+  "version": 2,
+  "public_ip": "10.1.0.1",
+  "egress_interface": "vr-e1",
+  "exits": [
+    {
+      "id": "by-name",
+      "name": "Domain",
+      "host": "exit.example.test",
+      "forwards": [
+        {"proto": "tcp", "listen": 12000, "target": 443},
+        {"proto": "udp", "listen": 12000, "target": 443}
+      ]
+    }
+  ]
+}
+JSON
+printf '%s\n' "exit.example.test 10.2.0.2" >"${BASE}/hosts.map"
+inside apply-config "${CFG}/domain.json"
+got="$(client_fetch 12000)"
+[[ "$got" == "exit1-443" ]] || { printf 'FAIL: домен вёл не на exit1: [%s]\n' "$got" >&2; exit 1; }
+printf '%s\n' "exit.example.test 10.3.0.2" >"${BASE}/hosts.map"
+inside apply-config "${CFG}/domain.json"
+flush_conntrack
+got="$(client_fetch 12000)"
+[[ "$got" == "exit2-443" ]] || { printf 'FAIL: смена A не переключила проброс: [%s]\n' "$got" >&2; exit 1; }
+got="$(udp_fetch 12000)"
+[[ "$got" == "exit2-udp-443" ]] || { printf 'FAIL: доменный UDP не дошёл до exit2: [%s]\n' "$got" >&2; exit 1; }
+
+inside uninstall
+ip netns exec mex-relay iptables -S INPUT | grep -q foreign-ssh
+if ip netns exec mex-relay iptables-save | grep -q 'MEX_\|mex:'; then
+  printf '%s\n' "FAIL: после второго uninstall остались наши правила" >&2
+  exit 1
+fi
 
 printf '%s\n' "OK netns"
 if ip netns exec mex-relay iptables -t mangle -S FORWARD | grep -q 'mex:tcpmss'; then

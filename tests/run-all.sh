@@ -23,12 +23,14 @@ bash tests/test-forbidden.sh
 bash tests/test-validation.sh
 bash tests/test-ports.sh
 bash tests/test-rules.sh
+bash tests/test-contract.sh
 
 echo "== help =="
-bash install.sh --help | grep -q "Multi-Exit Relay"
-bash install.sh --version | grep -q "1.0.0"
-bash relay help | grep -q "change-ip"
-bash relay version | grep -q "1.0.0"
+bash install.sh --help | grep -q "non-interactive"
+bash install.sh --version | grep -q "2.0.0"
+bash relay help | grep -q -- "--json"
+bash relay version | grep -q "2.0.0"
+bash relay version --json | jq -e '.version == "2.0.0"' >/dev/null
 bash uninstall.sh --help | grep -q "purge-config"
 
 echo "== netns =="

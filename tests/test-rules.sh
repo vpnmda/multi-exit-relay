@@ -42,7 +42,7 @@ assert_no_global_masq() {
     [[ "$line" == *foreign-masq* ]] && continue
     [[ "$line" == *"-d "* ]] || fail "MASQUERADE без адреса назначения: ${line}"
     [[ "$line" == *"--dport "* ]] || fail "MASQUERADE без порта: ${line}"
-    [[ "$line" == *" -p tcp "* || "$line" == *"-p tcp"* ]] || fail "MASQUERADE не TCP: ${line}"
+    [[ "$line" == *"-p tcp"* || "$line" == *"-p udp"* ]] || fail "MASQUERADE без tcp/udp: ${line}"
   done < <(mex_iptables -t nat -S 2>/dev/null || true)
 }
 
@@ -50,10 +50,8 @@ seed_foreign
 : >"$MEX_DRY_RUN_LOG"
 
 assert_ok mex_exit_add "Германия" "203.0.113.10"
-assert_eq "$(jq -r '.exits[0].relay_port_443' "$MEX_CONFIG_FILE")" "443" "первый порт"
-assert_eq "$(jq -r '.exits[0].relay_port_8443' "$MEX_CONFIG_FILE")" "8443" "второй порт"
-assert_eq "$(jq -r '.exits[0].exit_port_443' "$MEX_CONFIG_FILE")" "443" "порт Exit 443"
-assert_eq "$(jq -r '.exits[0].exit_port_8443' "$MEX_CONFIG_FILE")" "8443" "порт Exit 8443"
+assert_eq "$(jq -r '.exits[0].host' "$MEX_CONFIG_FILE")" "203.0.113.10" "host первого Exit"
+assert_eq "$(jq -c '.exits[0].forwards' "$MEX_CONFIG_FILE")" '[{"proto":"tcp","listen":443,"target":443},{"proto":"tcp","listen":8443,"target":8443}]' "пробросы первого Exit"
 assert_exit_rules exit-1
 assert_foreign_intact
 assert_no_global_masq
@@ -72,14 +70,14 @@ if grep -Eq '(^| )-A( |$)' "$MEX_DRY_RUN_LOG"; then
   fail "повторное применение добавило правила: $(grep -E '(^| )-A( |$)' "$MEX_DRY_RUN_LOG" | head)"
 fi
 assert_eq "$(count_rules nat MEX_PREROUTING)" "2" "идемпотентность DNAT"
-assert_eq "$(count_rules filter MEX_FORWARD)" "6" "идемпотентность FORWARD"
+assert_eq "$(count_rules filter MEX_FORWARD)" "7" "идемпотентность FORWARD"
 
-before="$(jq -c '.exits[0] | {relay_port_443, relay_port_8443}' "$MEX_CONFIG_FILE")"
+before="$(jq -c '.exits[0].forwards' "$MEX_CONFIG_FILE")"
 assert_ok mex_exit_add "Нидерланды" "203.0.113.11"
-after="$(jq -c '.exits[0] | {relay_port_443, relay_port_8443}' "$MEX_CONFIG_FILE")"
+after="$(jq -c '.exits[0].forwards' "$MEX_CONFIG_FILE")"
 assert_eq "$after" "$before" "порты первого Exit не изменились"
-assert_eq "$(jq -r '.exits[1].relay_port_443' "$MEX_CONFIG_FILE")" "10443" "второй Exit порт 1"
-assert_eq "$(jq -r '.exits[1].relay_port_8443' "$MEX_CONFIG_FILE")" "18443" "второй Exit порт 2"
+assert_eq "$(jq -r '.exits[1].forwards[0].listen' "$MEX_CONFIG_FILE")" "10443" "второй Exit порт 1"
+assert_eq "$(jq -r '.exits[1].forwards[1].listen' "$MEX_CONFIG_FILE")" "18443" "второй Exit порт 2"
 assert_exit_rules exit-1
 assert_exit_rules exit-2
 
@@ -89,7 +87,7 @@ assert_ok mex_exit_add "Польша" "203.0.113.14"
 assert_ok mex_exit_add "Франция" "203.0.113.15"
 assert_eq "$(jq -r '.exits | length' "$MEX_CONFIG_FILE")" "6" "шесть Exit"
 expected=$'443\t8443\n10443\t18443\n20443\t28443\n30443\t38443\n40443\t48443\n50443\t58443'
-got="$(jq -r '.exits[] | [.relay_port_443, .relay_port_8443] | @tsv' "$MEX_CONFIG_FILE")"
+got="$(jq -r '.exits[] | [.forwards[] | select(.proto=="tcp").listen] | @tsv' "$MEX_CONFIG_FILE")"
 assert_eq "$got" "$expected" "таблица портов шести Exit"
 for id in exit-1 exit-2 exit-3 exit-4 exit-5 exit-6; do
   assert_exit_rules "$id"
@@ -97,9 +95,9 @@ done
 assert_eq "$(count_rules mangle FORWARD)" "1" "TCPMSS не дублируется на шести Exit"
 
 assert_ok mex_exit_add "Седьмой" "203.0.113.16"
-assert_eq "$(jq -r '.exits[6].relay_port_443' "$MEX_CONFIG_FILE")" "11443" "седьмой порт 1"
-assert_eq "$(jq -r '.exits[6].relay_port_8443' "$MEX_CONFIG_FILE")" "19443" "седьмой порт 2"
-(( $(jq -r '.exits[6].relay_port_8443' "$MEX_CONFIG_FILE") <= 65535 )) || fail "порт вне диапазона"
+assert_eq "$(jq -r '.exits[6].forwards[0].listen' "$MEX_CONFIG_FILE")" "11443" "седьмой порт 1"
+assert_eq "$(jq -r '.exits[6].forwards[1].listen' "$MEX_CONFIG_FILE")" "19443" "седьмой порт 2"
+(( $(jq -r '.exits[6].forwards[1].listen' "$MEX_CONFIG_FILE") <= 65535 )) || fail "порт вне диапазона"
 
 assert_ok mex_exit_remove exit-3
 assert_eq "$(jq -r '.exits | length' "$MEX_CONFIG_FILE")" "6" "после удаления осталось шесть"
@@ -109,14 +107,14 @@ fi
 for id in exit-1 exit-2 exit-4 exit-5 exit-6 exit-7; do
   assert_exit_rules "$id"
 done
-assert_eq "$(jq -r '.exits[] | select(.id=="exit-1") | .relay_port_443' "$MEX_CONFIG_FILE")" "443" "порт exit-1 после удаления"
+assert_eq "$(jq -r '.exits[] | select(.id=="exit-1") | .forwards[0].listen' "$MEX_CONFIG_FILE")" "443" "порт exit-1 после удаления"
 assert_foreign_intact
 
-ports_before="$(jq -r '.exits[] | select(.id=="exit-2") | "\(.relay_port_443) \(.relay_port_8443)"' "$MEX_CONFIG_FILE")"
+ports_before="$(jq -r '.exits[] | select(.id=="exit-2") | [.forwards[].listen] | join(" ")' "$MEX_CONFIG_FILE")"
 assert_ok mex_exit_change_ip exit-2 203.0.113.30
-ports_after="$(jq -r '.exits[] | select(.id=="exit-2") | "\(.relay_port_443) \(.relay_port_8443)"' "$MEX_CONFIG_FILE")"
+ports_after="$(jq -r '.exits[] | select(.id=="exit-2") | [.forwards[].listen] | join(" ")' "$MEX_CONFIG_FILE")"
 assert_eq "$ports_after" "$ports_before" "смена IP сохраняет порты"
-assert_eq "$(jq -r '.exits[] | select(.id=="exit-2") | .ip' "$MEX_CONFIG_FILE")" "203.0.113.30" "новый IP"
+assert_eq "$(jq -r '.exits[] | select(.id=="exit-2") | .host' "$MEX_CONFIG_FILE")" "203.0.113.30" "новый IP"
 rule_text nat MEX_PREROUTING | grep -q '203.0.113.30:443' || fail "DNAT не указывает на новый IP"
 if rule_text nat MEX_PREROUTING | grep -q '203.0.113.11:443'; then
   fail "старый IP остался в DNAT"
@@ -153,18 +151,18 @@ fi
 err="$(mex_exit_add "Плохой" "198.51.100.9" 2>&1 >/dev/null || true)"
 printf '%s\n' "$err" | grep -q "только проверка доступности TCP-порта" || fail "нет формулировки TCP-проверки: ${err}"
 printf '%s\n' "$err" | grep -q "не проверка REALITY" || fail "нет уточнения, что это не REALITY: ${err}"
-if jq -e '.exits[] | select(.ip=="198.51.100.9")' "$MEX_CONFIG_FILE" >/dev/null; then
+if jq -e '.exits[] | select(.host=="198.51.100.9")' "$MEX_CONFIG_FILE" >/dev/null; then
   fail "недоступный Exit был добавлен"
 fi
 assert_ok mex_exit_add "Принудительный" "198.51.100.9" "" "" 1
-assert_eq "$(jq -r '.exits[] | select(.ip=="198.51.100.9") | .status' "$MEX_CONFIG_FILE")" "active-forced" "статус force"
+assert_eq "$(jq -r '.exits[] | select(.host=="198.51.100.9") | .status' "$MEX_CONFIG_FILE")" "active-forced" "статус force"
 
 if mex_exit_add "Ручной" "203.0.113.21" 25000 26000; then
   :
 else
   fail "ручные свободные порты должны приниматься"
 fi
-assert_eq "$(jq -r '.exits[] | select(.ip=="203.0.113.21") | "\(.relay_port_443) \(.relay_port_8443)"' "$MEX_CONFIG_FILE")" "25000 26000" "ручные порты"
+assert_eq "$(jq -r '.exits[] | select(.host=="203.0.113.21") | [.forwards[].listen] | join(" ")' "$MEX_CONFIG_FILE")" "25000 26000" "ручные порты"
 if mex_exit_add "Занятый" "203.0.113.22" 25000 27000; then
   fail "занятый ручной порт нельзя перезаписать"
 fi

@@ -5,7 +5,9 @@
 #   nat/MEX_PREROUTING, nat/MEX_POSTROUTING, filter/MEX_FORWARD
 # Переход из системных цепочек ставится один раз, в позицию 1.
 # На каждый Exit — отдельные DNAT, FORWARD и MASQUERADE с комментарием mex:<id>.
-# Глобальная MASQUERADE не используется. UDP нет. SNI не меняется.
+# Глобальная MASQUERADE не используется. TCP и UDP пробрасываются одинаково:
+# DNAT, FORWARD (NEW и ESTABLISHED,RELATED) и отдельный MASQUERADE на адрес Exit.
+# SNI не меняется. Неизменённое правило не удаляется и не создаётся заново.
 # TCPMSS --clamp-mss-to-pmtu добавляется один раз в mangle/FORWARD.
 #
 # MEX_DRY_RUN=1 не вызывает ядро: команды печатаются и исполняются симулятором.
@@ -21,6 +23,8 @@ MEX_IPTABLES_LOADED=1
 
 # shellcheck source=validation.sh
 source "$(dirname "${BASH_SOURCE[0]}")/validation.sh"
+# shellcheck source=resolve.sh
+source "$(dirname "${BASH_SOURCE[0]}")/resolve.sh"
 
 mex_spec_join() {
   local out="" a
@@ -547,45 +551,256 @@ mex_iptables_ensure_base() {
   return 0
 }
 
-mex_iptables_validate_endpoint() {
-  local id="$1" ip="$2" rp1="$3" rp2="$4" ep1="$5" ep2="$6"
-  mex_valid_exit_id "$id" || return 1
-  mex_valid_ipv4 "$ip" || return 1
-  mex_valid_port "$rp1" || return 1
-  mex_valid_port "$rp2" || return 1
-  [[ "$ep1" == "443" && "$ep2" == "8443" ]] || return 1
-  (( rp1 != rp2 )) || return 1
+mex_listen_local_busy() {
+  local proto="$1"
+  local port="$2"
+  local -a flags=(-H -lnt)
+  local out addr p
+  if [[ "$proto" == "udp" ]]; then
+    flags=(-H -lnu)
+  fi
+  out="$("${MEX_SS_BIN}" "${flags[@]}" 2>/dev/null || true)"
+  while read -r _ _ _ addr _; do
+    [[ -n "${addr:-}" ]] || continue
+    p="${addr##*:}"
+    [[ "$p" == "$port" ]] && return 0
+  done <<<"$out"
+  return 1
+}
+
+mex_listen_foreign_dnat() {
+  local proto="$1"
+  local port="$2"
+  local line dport
+  while IFS= read -r line; do
+    [[ "$line" == "-A "* ]] || continue
+    [[ "$line" == "-A MEX_"* ]] && continue
+    [[ "$line" == *"mex:"* ]] && continue
+    [[ "$line" == *"-j DNAT"* || "$line" == *"-j REDIRECT"* ]] || continue
+    if [[ "$line" == *"-p udp"* && "$proto" != "udp" ]]; then
+      continue
+    fi
+    if [[ "$line" == *"-p tcp"* && "$proto" != "tcp" ]]; then
+      continue
+    fi
+    if [[ "$line" =~ --dport[[:space:]]+([0-9]+) ]]; then
+      dport="${BASH_REMATCH[1]}"
+      [[ "$dport" == "$port" ]] && return 0
+    fi
+  done < <(mex_iptables -t nat -S 2>/dev/null || true)
+  return 1
+}
+
+mex_ip_assigned_locally() {
+  local ip="$1"
+  local out
+  out="$("${MEX_IP_BIN}" -4 -o addr show 2>/dev/null || true)"
+  [[ -n "$out" ]] || return 1
+  grep -Eq "(^|[[:space:]])${ip}/" <<<"$out"
+}
+
+mex_apply_check_listen() {
+  local cfg="$1"
+  local id proto listen
+  while IFS=$'\t' read -r id proto listen; do
+    [[ -n "$id" ]] || continue
+    if mex_listen_local_busy "$proto" "$listen"; then
+      mex_json_error 3 listen_busy "Порт ${proto}/${listen} занят локальным процессом. Правила не изменены." || return $?
+    fi
+    if mex_listen_foreign_dnat "$proto" "$listen"; then
+      mex_json_error 3 listen_foreign_dnat "Чужой DNAT уже занимает ${proto}/${listen}. Правила не изменены." || return $?
+    fi
+  done < <(jq -r '.exits[] | .id as $id | .forwards[]? | [$id, .proto, (.listen|tostring)] | @tsv' "$cfg")
   return 0
 }
 
-mex_iptables_apply_exit() {
-  local id="$1" ip="$2" rp1="$3" rp2="$4" ep1="$5" ep2="$6"
-  local c="mex:${id}"
-  if ! mex_iptables_validate_endpoint "$id" "$ip" "$rp1" "$rp2" "$ep1" "$ep2"; then
-    mex_fail "Внутренние параметры Exit ${id} не прошли проверку. Правила не изменены." || true
-    return 1
+mex_desired_add() {
+  local table="$1"
+  local chain="$2"
+  shift 2
+  local canon key line a
+  canon="$(mex_canon_from_args "$@")"
+  key="${table}|${chain}|${canon}"
+  if [[ -n "${MEX_DESIRED_SEEN[$key]+x}" ]]; then
+    return 0
   fi
-  mex_iptables_ensure_base || return 1
-  mex_iptables_ensure_rule nat MEX_PREROUTING \
-    -p tcp --dport "$rp1" -m comment --comment "$c" -j DNAT --to-destination "${ip}:${ep1}" || return 1
-  mex_iptables_ensure_rule nat MEX_PREROUTING \
-    -p tcp --dport "$rp2" -m comment --comment "$c" -j DNAT --to-destination "${ip}:${ep2}" || return 1
-  mex_iptables_ensure_rule nat MEX_POSTROUTING \
-    -p tcp -d "$ip" --dport "$ep1" -m comment --comment "$c" -j MASQUERADE || return 1
-  mex_iptables_ensure_rule nat MEX_POSTROUTING \
-    -p tcp -d "$ip" --dport "$ep2" -m comment --comment "$c" -j MASQUERADE || return 1
-  mex_iptables_ensure_rule filter MEX_FORWARD \
-    -p tcp -d "$ip" --dport "$ep1" -m conntrack --ctstate NEW -m comment --comment "$c" -j ACCEPT || return 1
-  mex_iptables_ensure_rule filter MEX_FORWARD \
-    -p tcp -d "$ip" --dport "$ep2" -m conntrack --ctstate NEW -m comment --comment "$c" -j ACCEPT || return 1
-  mex_iptables_ensure_rule filter MEX_FORWARD \
-    -p tcp -d "$ip" --dport "$ep1" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment "$c" -j ACCEPT || return 1
-  mex_iptables_ensure_rule filter MEX_FORWARD \
-    -p tcp -s "$ip" --sport "$ep1" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment "$c" -j ACCEPT || return 1
-  mex_iptables_ensure_rule filter MEX_FORWARD \
-    -p tcp -d "$ip" --dport "$ep2" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment "$c" -j ACCEPT || return 1
-  mex_iptables_ensure_rule filter MEX_FORWARD \
-    -p tcp -s "$ip" --sport "$ep2" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment "$c" -j ACCEPT || return 1
+  MEX_DESIRED_SEEN["$key"]=1
+  line="${table}"$'\t'"${chain}"
+  for a in "$@"; do
+    line+=$'\t'"$a"
+  done
+  printf '%s\n' "$line" >>"$MEX_DESIRED_FILE"
+}
+
+mex_desired_build() {
+  local cfg="$1"
+  local id proto listen target ip c n=0
+  MEX_DESIRED_FILE="$(mktemp)"
+  unset MEX_DESIRED_SEEN
+  declare -gA MEX_DESIRED_SEEN=()
+  : >"$MEX_DESIRED_FILE"
+  while IFS=$'\t' read -r id proto listen target; do
+    [[ -n "$id" ]] || continue
+    ip="${MEX_RESOLVED_IP[$id]:-}"
+    if ! mex_valid_ipv4 "$ip"; then
+      mex_json_error 3 resolve_failed "Нет IPv4-адреса для ${id}. Правила не изменены." || return $?
+    fi
+    if ! mex_valid_port "$listen" || ! mex_valid_port "$target"; then
+      mex_json_error 2 config_invalid "Некорректный порт у ${id}. Правила не изменены." || return $?
+    fi
+    if [[ "$proto" != "tcp" && "$proto" != "udp" ]]; then
+      mex_json_error 2 config_invalid "Некорректный протокол у ${id}. Правила не изменены." || return $?
+    fi
+    n=$((n + 1))
+    c="mex:${id}"
+    mex_desired_add nat MEX_PREROUTING \
+      -p "$proto" --dport "$listen" -m comment --comment "$c" -j DNAT --to-destination "${ip}:${target}"
+    mex_desired_add nat MEX_POSTROUTING \
+      -p "$proto" -d "$ip" --dport "$target" -m comment --comment "$c" -j MASQUERADE
+    mex_desired_add filter MEX_FORWARD \
+      -p "$proto" -d "$ip" --dport "$target" -m conntrack --ctstate NEW -m comment --comment "$c" -j ACCEPT
+    mex_desired_add filter MEX_FORWARD \
+      -p "$proto" -d "$ip" --dport "$target" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment "$c" -j ACCEPT
+    mex_desired_add filter MEX_FORWARD \
+      -p "$proto" -s "$ip" --sport "$target" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment "$c" -j ACCEPT
+  done < <(jq -r '.exits[] | .id as $id | .forwards[]? | [$id, .proto, (.listen|tostring), (.target|tostring)] | @tsv' "$cfg")
+  if (( n > 0 )); then
+    mex_desired_add filter MEX_FORWARD \
+      -p icmp -m conntrack --ctstate RELATED -m comment --comment mex:related-icmp -j ACCEPT
+  fi
+  return 0
+}
+
+mex_iptables_delete_stale() {
+  local table="$1"
+  local chain="$2"
+  local -a rests=() stale=() args=()
+  local line rest i canon comment key n j
+  if ! mex_iptables_chain_exists "$table" "$chain"; then
+    return 0
+  fi
+  while IFS= read -r line; do
+    [[ "$line" == "-A ${chain} "* ]] || continue
+    rest="${line#-A "${chain}" }"
+    rests+=("$rest")
+  done < <(mex_iptables -t "$table" -S "$chain" 2>/dev/null || true)
+  if ((${#rests[@]} == 0)); then
+    return 0
+  fi
+  for i in "${!rests[@]}"; do
+    read -r -a args <<<"${rests[$i]}"
+    canon="$(mex_canon_from_args "${args[@]}")"
+    comment="${canon#*;c=}"
+    comment="${comment%%;j=*}"
+    [[ "$comment" == mex:* ]] || continue
+    key="${table}|${chain}|${canon}"
+    if [[ -n "${MEX_WANT_CANON[$key]+x}" ]]; then
+      continue
+    fi
+    stale+=("$((i + 1))")
+  done
+  n="${#stale[@]}"
+  for (( j = n - 1; j >= 0; j-- )); do
+    if ! mex_iptables -t "$table" -D "$chain" "${stale[$j]}" >/dev/null; then
+      mex_json_error 3 apply_failed "Не удалось удалить устаревшее правило ${chain} №${stale[$j]}." || return $?
+    fi
+    MEX_RULES_REMOVED=$((MEX_RULES_REMOVED + 1))
+  done
+  return 0
+}
+
+mex_iptables_reconcile() {
+  local cfg="$1"
+  local table chain spec_rest canon key
+  local -a args=()
+  mex_desired_build "$cfg" || return $?
+  unset MEX_WANT_CANON
+  declare -gA MEX_WANT_CANON=()
+  MEX_RULES_ADDED=0
+  MEX_RULES_REMOVED=0
+  MEX_RULES_UNCHANGED=0
+  local add_failed=0
+  while IFS=$'\t' read -r table chain spec_rest; do
+    [[ -n "$table" ]] || continue
+    IFS=$'\t' read -r -a args <<<"$spec_rest"
+    canon="$(mex_canon_from_args "${args[@]}")"
+    key="${table}|${chain}|${canon}"
+    MEX_WANT_CANON["$key"]=1
+    if mex_iptables -t "$table" -C "$chain" "${args[@]}" >/dev/null 2>&1; then
+      MEX_RULES_UNCHANGED=$((MEX_RULES_UNCHANGED + 1))
+    else
+      if ! mex_iptables -t "$table" -A "$chain" "${args[@]}" >/dev/null; then
+        add_failed=1
+        break
+      fi
+      MEX_RULES_ADDED=$((MEX_RULES_ADDED + 1))
+    fi
+  done <"$MEX_DESIRED_FILE"
+  rm -f "$MEX_DESIRED_FILE"
+  if (( add_failed == 1 )); then
+    mex_json_error 3 apply_failed "Не удалось добавить правило проброса." || return $?
+  fi
+  mex_iptables_delete_stale nat MEX_PREROUTING || return $?
+  mex_iptables_delete_stale nat MEX_POSTROUTING || return $?
+  mex_iptables_delete_stale filter MEX_FORWARD || return $?
+  return 0
+}
+
+# Печатает «dnat masq forward» из 0/1. Не меняет правила.
+mex_iptables_forward_flags() {
+  local id="$1" ip="$2" proto="$3" listen="$4" target="$5"
+  local c="mex:${id}"
+  local dnat=0 masq=0 fwd=0
+  if mex_iptables -t nat -C MEX_PREROUTING \
+    -p "$proto" --dport "$listen" -m comment --comment "$c" -j DNAT --to-destination "${ip}:${target}" >/dev/null 2>&1; then
+    dnat=1
+  fi
+  if mex_iptables -t nat -C MEX_POSTROUTING \
+    -p "$proto" -d "$ip" --dport "$target" -m comment --comment "$c" -j MASQUERADE >/dev/null 2>&1; then
+    masq=1
+  fi
+  if mex_iptables -C MEX_FORWARD \
+    -p "$proto" -d "$ip" --dport "$target" -m conntrack --ctstate NEW -m comment --comment "$c" -j ACCEPT >/dev/null 2>&1 \
+    && mex_iptables -C MEX_FORWARD \
+    -p "$proto" -d "$ip" --dport "$target" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment "$c" -j ACCEPT >/dev/null 2>&1 \
+    && mex_iptables -C MEX_FORWARD \
+    -p "$proto" -s "$ip" --sport "$target" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment "$c" -j ACCEPT >/dev/null 2>&1; then
+    fwd=1
+  fi
+  printf '%s %s %s\n' "$dnat" "$masq" "$fwd"
+}
+
+mex_dnat_destination_ip() {
+  local id="$1" proto="$2" listen="$3" target="$4"
+  local line ip
+  while IFS= read -r line; do
+    [[ "$line" == *"-j DNAT"* ]] || continue
+    [[ "$line" == *"-p ${proto} "* ]] || continue
+    [[ "$line" == *"comment mex:${id} "* || "$line" == *"comment mex:${id}" || "$line" == *"comment \"mex:${id}\""* ]] || continue
+    [[ "$line" == *"--dport ${listen} "* || "$line" == *"--dport ${listen}" ]] || continue
+    if [[ "$line" =~ --to-destination[[:space:]]+([0-9.]+):([0-9]+) ]]; then
+      [[ "${BASH_REMATCH[2]}" == "$target" ]] || continue
+      ip="${BASH_REMATCH[1]}"
+      printf '%s\n' "$ip"
+      return 0
+    fi
+  done < <(mex_iptables -t nat -S MEX_PREROUTING 2>/dev/null || true)
+  return 1
+}
+
+mex_dnat_counters() {
+  local id="$1" proto="$2" listen="$3" ip="$4" target="$5"
+  local line
+  while IFS= read -r line; do
+    [[ "$line" == *"/* mex:${id} */"* ]] || continue
+    [[ "$line" == *"${proto} dpt:${listen} "* ]] || continue
+    [[ "$line" == *"to:${ip}:${target}" ]] || continue
+    if [[ "$line" =~ ^[[:space:]]*([0-9]+)[[:space:]]+([0-9]+)[[:space:]]+([0-9]+)[[:space:]] ]]; then
+      printf '%s %s\n' "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+      return 0
+    fi
+  done < <(LC_ALL=C mex_iptables -t nat -L MEX_PREROUTING -n -v -x --line-numbers 2>/dev/null || true)
+  return 1
 }
 
 mex_iptables_remove_exit() {
@@ -676,38 +891,74 @@ mex_iptables_drop_orphans() {
 }
 
 mex_iptables_apply_exit_from_config() {
-  local id="$1"
-  local ip rp1 rp2 ep1 ep2
-  IFS=$'\t' read -r ip rp1 rp2 ep1 ep2 < <(
-    jq -r --arg id "$id" '
-      .exits[] | select(.id == $id)
-      | [.ip, .relay_port_443, .relay_port_8443, .exit_port_443, .exit_port_8443]
-      | @tsv
-    ' "$MEX_CONFIG_FILE"
-  )
-  if [[ -z "${ip:-}" ]]; then
-    mex_fail "Exit ${id} не найден в конфигурации." || true
-    return 1
-  fi
-  mex_iptables_apply_exit "$id" "$ip" "$rp1" "$rp2" "$ep1" "$ep2"
+  mex_iptables_apply_config
 }
 
 mex_iptables_apply_config() {
-  local id
-  if [[ ! -f "$MEX_CONFIG_FILE" ]]; then
-    mex_fail "Нет файла конфигурации ${MEX_CONFIG_FILE}." || true
-    return 1
+  local cfg="$MEX_CONFIG_FILE"
+  local ver err pub id ip resolved rc
+  if [[ ! -f "$cfg" ]]; then
+    mex_json_error 2 config_missing "Нет файла конфигурации ${cfg}." || return $?
   fi
-  if ! mex_config_validate_file "$MEX_CONFIG_FILE"; then
-    mex_fail "Файл ${MEX_CONFIG_FILE} не прошёл проверку схемы." || true
-    return 1
+  ver="$(jq -r '.version // empty' "$cfg" 2>/dev/null || true)"
+  if [[ "$ver" == "1" ]]; then
+    if ! mex_config_migrate_inplace "$cfg"; then
+      mex_json_error 2 config_invalid "Не удалось перевести ${cfg} со схемы v1 на v2. Правила не изменены." || return $?
+    fi
   fi
-  mex_iptables_ensure_base || return 1
-  mex_iptables_drop_orphans || return 1
-  while IFS= read -r id; do
-    [[ -n "$id" ]] || continue
-    mex_iptables_apply_exit_from_config "$id" || return 1
-  done < <(jq -r '.exits[].id' "$MEX_CONFIG_FILE")
+  if ! mex_config_classify_v2 "$cfg"; then
+    err="${MEX_CONFIG_ERROR:-config_invalid}"
+    case "$err" in
+      config_collision)
+        mex_json_error 2 config_collision "В конфигурации совпадают id или пара протокол/порт прослушивания. Один и тот же порт можно занять отдельно для tcp и udp. Правила не изменены." || return $?
+        ;;
+      listen_reserved)
+        mex_json_error 2 listen_reserved "TCP-порт 22 на Relay занимать нельзя: DNAT перехватил бы SSH. Правила не изменены." || return $?
+        ;;
+      *)
+        mex_json_error 2 config_invalid "Файл ${cfg} не прошёл проверку схемы v2. Правила не изменены." || return $?
+        ;;
+    esac
+  fi
+  resolved="$(mktemp)"
+  mex_resolve_config_file "$cfg" "$resolved"
+  rc=$?
+  if (( rc != 0 )); then
+    rm -f "$resolved"
+    return "$rc"
+  fi
+  pub="$(jq -r '.public_ip // empty' "$cfg")"
+  if ((${#MEX_RESOLVED_IP[@]} > 0)); then
+    for id in "${!MEX_RESOLVED_IP[@]}"; do
+      ip="${MEX_RESOLVED_IP[$id]}"
+      if [[ -n "$pub" && "$ip" == "$pub" ]]; then
+        rm -f "$resolved"
+        mex_json_error 2 host_is_local "Адрес ${ip} совпадает с публичным IP Relay. Правила не изменены." || return $?
+      fi
+      if mex_ip_assigned_locally "$ip"; then
+        rm -f "$resolved"
+        mex_json_error 2 host_is_local "Адрес ${ip} назначен локальному интерфейсу Relay. Правила не изменены." || return $?
+      fi
+    done
+  fi
+  mex_apply_check_listen "$cfg"
+  rc=$?
+  if (( rc != 0 )); then
+    rm -f "$resolved"
+    return "$rc"
+  fi
+  if ! mex_iptables_ensure_base; then
+    rm -f "$resolved"
+    mex_json_error 3 apply_failed "Не удалось подготовить цепочки Multi-Exit Relay. Чужие правила не изменялись." || return $?
+  fi
+  if ! mex_iptables_reconcile "$cfg"; then
+    rc=$?
+    rm -f "$resolved"
+    return "$rc"
+  fi
+  mex_state_store_resolved "$resolved" || true
+  rm -f "$resolved"
+  return 0
 }
 
 mex_iptables_uninstall() {
