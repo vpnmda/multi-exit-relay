@@ -56,6 +56,7 @@ setup_dry_env() {
   export MEX_SKIP_HOST_INTEGRATION=1
   export MEX_SKIP_NETFILTER_SAVE=1
   export MEX_SKIP_OS_CHECK=1
+  export MEX_SKIP_LOCK=1
   export MEX_ASSUME_ROUTE=1
   export MEX_QUIET=1
   export MEX_PUBLIC_IP="198.51.100.5"
@@ -66,20 +67,34 @@ setup_dry_env() {
   ss="${tmp}/ss"
   cat >"$ss" <<'EOF'
 #!/usr/bin/env bash
-if [[ -n "${MEX_SS_DATA:-}" && -f "${MEX_SS_DATA}" ]]; then
-  cat "${MEX_SS_DATA}"
+proto="tcp"
+for arg in "$@"; do
+  case "$arg" in
+    *u*) proto="udp" ;;
+  esac
+done
+if [[ "$proto" == "udp" ]]; then
+  if [[ -n "${MEX_SS_UDP_DATA:-}" && -f "${MEX_SS_UDP_DATA}" ]]; then
+    cat "${MEX_SS_UDP_DATA}"
+  fi
+else
+  if [[ -n "${MEX_SS_DATA:-}" && -f "${MEX_SS_DATA}" ]]; then
+    cat "${MEX_SS_DATA}"
+  fi
 fi
 exit 0
 EOF
   chmod 755 "$ss"
   export MEX_SS_BIN="$ss"
+  export MEX_SS_UDP_DATA="${tmp}/ss-udp.data"
   mkdir -p "$MEX_CONFIG_DIR" "$MEX_BIN_DIR" "$MEX_INSTALL_DIR" "$MEX_SIM_DIR"
   : >"$MEX_DRY_RUN_LOG"
   : >"$MEX_SS_DATA"
+  : >"$MEX_SS_UDP_DATA"
   local i
   : >"$MEX_TCP_STUB_FILE"
   for i in $(seq 1 30); do
-    printf '%s\n' "203.0.113.${i}:443 ok" "203.0.113.${i}:8443 ok" >>"$MEX_TCP_STUB_FILE"
+    printf '%s\n' "203.0.113.${i}:443 ok" "203.0.113.${i}:8443 ok" "203.0.113.${i}:* ok" >>"$MEX_TCP_STUB_FILE"
   done
   printf '%s\n' "198.51.100.9:443 fail" "198.51.100.9:8443 fail" >>"$MEX_TCP_STUB_FILE"
   printf '%s\n' "198.51.100.8:443 ok" "198.51.100.8:8443 fail" >>"$MEX_TCP_STUB_FILE"

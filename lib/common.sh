@@ -12,7 +12,7 @@ MEX_COMMON_LOADED=1
 
 # Используется relay и сообщениями установщика.
 # shellcheck disable=SC2034
-MEX_VERSION="1.0.0"
+MEX_VERSION="2.0.0"
 
 mex_init() {
   MEX_CONFIG_DIR="${MEX_CONFIG_DIR:-/etc/multi-exit-relay}"
@@ -45,6 +45,11 @@ mex_init() {
   MEX_ASSUME_YES="${MEX_ASSUME_YES:-0}"
   MEX_ASSUME_ROUTE="${MEX_ASSUME_ROUTE:-0}"
   MEX_QUIET="${MEX_QUIET:-0}"
+  MEX_JSON="${MEX_JSON:-0}"
+  MEX_INFO_STDERR="${MEX_INFO_STDERR:-0}"
+  MEX_JSON_COMMAND="${MEX_JSON_COMMAND:-}"
+  MEX_LOCK_WAIT="${MEX_LOCK_WAIT:-60}"
+  MEX_RESOLVE_TIMEOUT="${MEX_RESOLVE_TIMEOUT:-5}"
   if [[ "$MEX_DRY_RUN" == "1" && -z "${MEX_SIM_DIR:-}" ]]; then
     MEX_SIM_DIR="${MEX_CONFIG_DIR}/sim"
   fi
@@ -68,9 +73,15 @@ mex_log() {
 
 mex_info() {
   mex_log INFO "$*"
-  if [[ "${MEX_QUIET:-0}" != "1" ]]; then
-    printf '%s\n' "$*"
+  if [[ "${MEX_QUIET:-0}" == "1" ]]; then
+    return 0
   fi
+  # JSON-команды и relay apply держат stdout чистым: журнал идёт в stderr.
+  if [[ "${MEX_JSON:-0}" == "1" || "${MEX_INFO_STDERR:-0}" == "1" ]]; then
+    printf '%s\n' "$*" >&2
+    return 0
+  fi
+  printf '%s\n' "$*"
 }
 
 mex_warn() {
@@ -125,9 +136,9 @@ mex_acquire_lock() {
     mex_fail "Не удалось открыть файл блокировки ${lock}." || true
     return 1
   }
-  if ! flock -n 9; then
+  if ! flock -w "${MEX_LOCK_WAIT:-60}" 9; then
     mex_fail "Уже выполняется другой экземпляр Multi-Exit Relay." || true
-    return 1
+    return 5
   fi
   MEX_LOCK_HELD=1
 }
@@ -319,6 +330,8 @@ mex_parse_common_flags() {
   export MEX_OPT_P2=""
   export MEX_OPT_PURGE_CONFIG=0
   export MEX_OPT_BACKUP=""
+  export MEX_OPT_JSON=0
+  export MEX_OPT_CONFIG=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --yes|-y)
@@ -328,6 +341,19 @@ mex_parse_common_flags() {
       --force)
         export MEX_OPT_FORCE=1
         shift
+        ;;
+      --json)
+        export MEX_OPT_JSON=1
+        MEX_JSON=1
+        shift
+        ;;
+      --config)
+        export MEX_OPT_CONFIG="${2:-}"
+        if [[ -z "$MEX_OPT_CONFIG" ]]; then
+          mex_fail "Укажите путь после --config." || true
+          return 1
+        fi
+        shift 2
         ;;
       --name)
         export MEX_OPT_NAME="${2:-}"
@@ -370,4 +396,36 @@ mex_parse_common_flags() {
   if [[ "$MEX_OPT_YES" == "1" ]]; then
     MEX_ASSUME_YES=1
   fi
+}
+
+# Печатает стабильную JSON-ошибку на stdout, если включён MEX_JSON, текст — на stderr.
+# Код возврата равен первому аргументу. Коды error стабильны, message — для человека.
+mex_json_error() {
+  local exit_code="$1"
+  local err="$2"
+  local message="$3"
+  mex_log ERROR "${err}: ${message}"
+  printf 'Ошибка: %s\n' "$message" >&2
+  if [[ "${MEX_JSON:-0}" == "1" ]]; then
+    if ! command -v jq >/dev/null 2>&1; then
+      printf '%s\n' "Ошибка: для --json нужна утилита jq." >&2
+      return 3
+    fi
+    jq -n \
+      --arg command "${MEX_JSON_COMMAND:-}" \
+      --arg error "$err" \
+      --arg message "$message" \
+      --arg version "${MEX_VERSION:-}" \
+      --arg config_file "${MEX_CONFIG_FILE:-}" \
+      '{
+        ok: false,
+        command: $command,
+        error: $error,
+        message: $message,
+        version: $version,
+        config_file: $config_file,
+        problems: [{code: $error, message: $message}]
+      }'
+  fi
+  return "$exit_code"
 }

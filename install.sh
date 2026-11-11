@@ -19,10 +19,15 @@ fi
 
 mex_print_help() {
   cat <<'EOF'
-Multi-Exit Relay — установщик TCP-проброса с Relay на Exit-серверы.
+Multi-Exit Relay — установщик проброса TCP и UDP с Relay на Exit-серверы.
 
 Запуск:
   sudo bash install.sh
+  sudo bash install.sh --non-interactive
+
+--non-interactive ставит зависимости, команду relay, sysctl, службу и таймер
+резолва имён. Вопросы не задаются. Повторный запуск ничего не дублирует.
+Если config.json уже есть и в нём есть пробросы, правила применяются сразу.
 
 Меню:
   1  Установить новый Relay
@@ -47,15 +52,32 @@ Multi-Exit Relay — установщик TCP-проброса с Relay на Exi
 EOF
 }
 
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-  mex_print_help
-  exit 0
-fi
-
-if [[ "${1:-}" == "--version" ]]; then
-  printf '%s\n' "multi-exit-relay 1.0.0"
-  exit 0
-fi
+MEX_NONINTERACTIVE=0
+for _mex_arg in "$@"; do
+  case "$_mex_arg" in
+    -h|--help)
+      mex_print_help
+      exit 0
+      ;;
+    --version)
+      if [[ -f "${_mex_dir}/lib/common.sh" ]]; then
+        _mex_ver="$(sed -n 's/^MEX_VERSION="\([^"]*\)".*/\1/p' "${_mex_dir}/lib/common.sh" | head -n 1)"
+      fi
+      printf '%s\n' "multi-exit-relay ${_mex_ver:-2.0.0}"
+      exit 0
+      ;;
+    --non-interactive|--noninteractive)
+      MEX_NONINTERACTIVE=1
+      ;;
+    --)
+      ;;
+    -*)
+      printf '%s\n' "Ошибка: неизвестный аргумент: ${_mex_arg}" >&2
+      exit 1
+      ;;
+  esac
+done
+unset _mex_arg _mex_ver
 
 if [[ "$(id -u)" -ne 0 && "${MEX_SKIP_ROOT:-0}" != "1" ]]; then
   printf '%s\n' "Ошибка: запустите установщик от root (sudo bash install.sh)." >&2
@@ -115,7 +137,7 @@ mex_menu() {
     cat <<'EOF'
 
 ==============================================
- Multi-Exit Relay — TCP-проброс на Exit
+ Multi-Exit Relay — проброс TCP и UDP на Exit
 ==============================================
  1) Установить новый Relay
  2) Добавить Exit
@@ -186,8 +208,14 @@ EOF
   done
 }
 
+if [[ "$MEX_NONINTERACTIVE" == "1" ]]; then
+  _mex_rc=0
+  mex_install_noninteractive || _mex_rc=$?
+  exit "$_mex_rc"
+fi
+
 if [[ ! -t 0 ]]; then
-  printf '%s\n' "Ошибка: интерактивное меню требует терминал. Для автоматизации используйте команду relay, например: relay add --name Германия --ip 203.0.113.10" >&2
+  printf '%s\n' "Ошибка: интерактивное меню требует терминал. Для автоматизации: sudo bash install.sh --non-interactive, затем relay apply и relay check --json." >&2
   exit 1
 fi
 

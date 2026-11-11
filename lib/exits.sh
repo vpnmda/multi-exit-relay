@@ -22,6 +22,12 @@ mex_config_ensure() {
       mex_fail "Файл ${MEX_CONFIG_FILE} повреждён или имеет неподдерживаемую схему." || true
       return 1
     fi
+    if [[ "$(jq -r '.version // empty' "$MEX_CONFIG_FILE")" == "1" ]]; then
+      if ! mex_config_migrate_inplace "$MEX_CONFIG_FILE"; then
+        mex_fail "Не удалось перевести ${MEX_CONFIG_FILE} со схемы v1 на v2." || true
+        return 1
+      fi
+    fi
     return 0
   fi
   now="$(mex_timestamp)"
@@ -32,7 +38,7 @@ mex_config_ensure() {
     --arg iface "$iface" \
     --arg now "$now" \
     '{
-      version: 1,
+      version: 2,
       public_ip: $pub,
       egress_interface: $iface,
       created_at: $now,
@@ -62,7 +68,15 @@ mex_tcp_probe() {
     if [[ ! -f "$MEX_TCP_STUB_FILE" ]]; then
       return 1
     fi
-    result="$(awk -v key="${ip}:${port}" '$1 == key { print $2; exit }' "$MEX_TCP_STUB_FILE")"
+    result="$(awk -v exact="${ip}:${port}" -v wild="${ip}:*" '
+      $1 == exact { exact_res = $2; has_exact = 1 }
+      $1 == wild && !has_wild { wild_res = $2; has_wild = 1 }
+      END {
+        if (has_exact) print exact_res
+        else if (has_wild) print wild_res
+        else print "fail"
+      }
+    ' "$MEX_TCP_STUB_FILE")"
     [[ "$result" == "ok" ]]
     return
   fi
@@ -173,7 +187,7 @@ mex_exit_add() {
   local want1="${3:-}"
   local want2="${4:-}"
   local force="${5:-0}"
-  local p1 p2 now tmp id
+  local p1 p2 now tmp id rc=0
   mex_require_root || return 1
   mex_acquire_lock || return 1
   mex_exit_precheck "$name" "$ip" "$want1" "$want2" "$force" || return 1
@@ -199,11 +213,11 @@ mex_exit_add() {
       | .exits += [{
           id: ("exit-" + (.next_seq | tostring)),
           name: $name,
-          ip: $ip,
-          relay_port_443: $rp1,
-          relay_port_8443: $rp2,
-          exit_port_443: 443,
-          exit_port_8443: 8443,
+          host: $ip,
+          forwards: [
+            {proto: "tcp", listen: $rp1, target: 443},
+            {proto: "tcp", listen: $rp2, target: 8443}
+          ],
           status: (if $force == "1" then "active-forced" else "active" end),
           added_at: $now,
           tcp_check_forced: ($force == "1")
@@ -216,16 +230,17 @@ mex_exit_add() {
   fi
   chmod 600 "$tmp" 2>/dev/null || true
   mv -f "$tmp" "$MEX_CONFIG_FILE"
-  id="$(jq -r --arg ip "$ip" '.exits[] | select(.ip == $ip) | .id' "$MEX_CONFIG_FILE")"
-  if ! mex_iptables_apply_exit_from_config "$id"; then
+  id="$(jq -r --arg ip "$ip" '.exits[] | select(.host == $ip) | .id' "$MEX_CONFIG_FILE")"
+  mex_apply_from_config || rc=$?
+  if (( rc != 0 )); then
     tmp="$(mktemp)"
     jq --arg id "$id" '.exits |= map(select(.id != $id))' "$MEX_CONFIG_FILE" >"$tmp"
     chmod 600 "$tmp" 2>/dev/null || true
     mv -f "$tmp" "$MEX_CONFIG_FILE"
+    mex_iptables_apply_config || true
     mex_fail "Не удалось применить правила для ${id}. Запись об Exit удалена из конфигурации. Чужие правила не изменялись." || true
-    return 1
+    return "$rc"
   fi
-  mex_netfilter_save || true
   mex_info "Exit «${name}» (${ip}) добавлен. Порты Relay: ${p1} -> 443, ${p2} -> 8443. Порты других Exit не изменены."
   if [[ "${MEX_DRY_RUN:-0}" == "1" ]]; then
     mex_info "Режим dry-run: правила симулированы и в ядро не записывались."
@@ -276,7 +291,7 @@ mex_exit_change_ip() {
     mex_fail "Exit ${id} не найден." || true
     return 1
   fi
-  old_ip="$(jq -r --arg id "$id" '.exits[] | select(.id == $id) | .ip' "$MEX_CONFIG_FILE")"
+  old_ip="$(jq -r --arg id "$id" '.exits[] | select(.id == $id) | .host' "$MEX_CONFIG_FILE")"
   if [[ "$old_ip" == "$new_ip" ]]; then
     mex_info "IP Exit ${id} уже равен ${new_ip}. Порты не изменялись."
     return 0
@@ -302,7 +317,7 @@ mex_exit_change_ip() {
   jq --arg id "$id" --arg ip "$new_ip" --arg now "$(mex_timestamp)" --arg force "$force" '
     .exits |= map(
       if .id == $id then
-        .ip = $ip
+        .host = $ip
         | .status = (if $force == "1" then "active-forced" else "active" end)
         | .tcp_check_forced = ($force == "1")
         | .updated_at = $now
@@ -313,13 +328,12 @@ mex_exit_change_ip() {
   ' "$MEX_CONFIG_FILE" >"$tmp"
   chmod 600 "$tmp" 2>/dev/null || true
   mv -f "$tmp" "$MEX_CONFIG_FILE"
-  if ! mex_iptables_remove_exit "$id" || ! mex_iptables_apply_exit_from_config "$id"; then
+  if ! mex_apply_from_config; then
     cp -a "$backup_cfg" "$MEX_CONFIG_FILE"
-    mex_iptables_apply_exit_from_config "$id" || true
+    mex_iptables_apply_config || true
     mex_fail "Не удалось сменить IP. Восстановлена предыдущая конфигурация ${id}, порты не менялись." || true
     return 1
   fi
-  mex_netfilter_save || true
   mex_info "IP Exit ${id} изменён с ${old_ip} на ${new_ip}. Порты Relay сохранены."
 }
 
@@ -342,11 +356,11 @@ mex_exit_print_table() {
     return 0
   fi
   {
-    printf 'СТРАНА\tIP EXIT\tПОРТ RELAY 1\tПОРТ RELAY 2\tСТАТУС\n'
-    while IFS=$'\t' read -r name ip p1 p2 status; do
+    printf 'СТРАНА\tHOST\tПРОБРОС\tСТАТУС\n'
+    while IFS=$'\t' read -r name host forwards status; do
       [[ -n "$name" ]] || continue
-      printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$ip" "$p1" "$p2" "$(mex_status_ru "$status")"
-    done < <(jq -r '.exits[] | [.name, .ip, (.relay_port_443|tostring), (.relay_port_8443|tostring), .status] | @tsv' "$MEX_CONFIG_FILE")
+      printf '%s\t%s\t%s\t%s\n' "$name" "$host" "$forwards" "$(mex_status_ru "$status")"
+    done < <(jq -r '.exits[] | [.name, .host, ([.forwards[]? | "\(.proto)/\(.listen)->\(.target)"] | join(", ")), (.status // "active")] | @tsv' "$MEX_CONFIG_FILE")
   } | if command -v column >/dev/null 2>&1; then
     column -t -s $'\t'
   else
@@ -357,11 +371,11 @@ mex_exit_print_table() {
 mex_exit_describe_links() {
   local pub name ip p1 p2
   pub="$(jq -r '.public_ip // "IP_RELAY"' "$MEX_CONFIG_FILE" 2>/dev/null || printf '%s' "IP_RELAY")"
-  mex_info "Клиентская ссылка VLESS берётся в 3X-UI на Exit. Замените адрес на ${pub} и порт на порт Relay. SNI, pbk, sid и flow не меняйте."
-  while IFS=$'\t' read -r name ip p1 p2; do
-    [[ -n "$ip" ]] || continue
-    mex_info "  ${name}: ${ip}:443 -> ${pub}:${p1}; ${ip}:8443 -> ${pub}:${p2}"
-  done < <(jq -r '.exits[] | [.name, .ip, (.relay_port_443|tostring), (.relay_port_8443|tostring)] | @tsv' "$MEX_CONFIG_FILE")
+  mex_info "Клиентская ссылка берётся на Exit. Замените адрес на ${pub} и порт на порт Relay для нужного проброса. SNI, ключи и пароли не меняйте. UDP (Hysteria2/QUIC) использует UDP-порт Relay."
+  while IFS=$'\t' read -r name host proto listen target; do
+    [[ -n "$host" ]] || continue
+    mex_info "  ${name}: ${proto} ${host}:${target} -> ${pub}:${listen}"
+  done < <(jq -r '.exits[] | .name as $n | .host as $h | .forwards[]? | [$n, $h, .proto, (.listen|tostring), (.target|tostring)] | @tsv' "$MEX_CONFIG_FILE")
 }
 
 mex_ensure_sysctl() {
@@ -413,36 +427,80 @@ WantedBy=multi-user.target
 EOF
 }
 
+mex_systemd_resolve_service_text() {
+  local bin="${MEX_INSTALL_DIR}/relay"
+  cat <<EOF
+[Unit]
+Description=Multi-Exit Relay: повторный резолв имён Exit и сверка правил
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${bin} apply
+EOF
+}
+
+mex_systemd_resolve_timer_text() {
+  cat <<'EOF'
+[Unit]
+Description=Multi-Exit Relay: периодический резолв имён Exit
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+mex_systemd_paths() {
+  local dir
+  dir="$(dirname "$MEX_SYSTEMD_UNIT")"
+  MEX_SYSTEMD_RESOLVE_SERVICE="${dir}/multi-exit-relay-resolve.service"
+  MEX_SYSTEMD_RESOLVE_TIMER="${dir}/multi-exit-relay-resolve.timer"
+}
+
 mex_install_systemd() {
   local unit
   [[ "${MEX_SKIP_SYSTEMD:-0}" == "1" ]] && return 0
   unit="$MEX_SYSTEMD_UNIT"
+  mex_systemd_paths
   mkdir -p "$(dirname "$unit")"
   mex_systemd_unit_text >"$unit"
-  chmod 644 "$unit" 2>/dev/null || true
+  mex_systemd_resolve_service_text >"$MEX_SYSTEMD_RESOLVE_SERVICE"
+  mex_systemd_resolve_timer_text >"$MEX_SYSTEMD_RESOLVE_TIMER"
+  chmod 644 "$unit" "$MEX_SYSTEMD_RESOLVE_SERVICE" "$MEX_SYSTEMD_RESOLVE_TIMER" 2>/dev/null || true
   if [[ "${MEX_DRY_RUN:-0}" == "1" ]]; then
-    mex_log INFO "dry-run: systemctl не вызывался, юнит записан в ${unit}"
+    mex_log INFO "dry-run: systemctl не вызывался, юниты записаны в $(dirname "$unit")"
     return 0
   fi
   if ! mex_have systemctl; then
-    mex_warn "systemctl не найден. Юнит записан в ${unit}, но не включён."
+    mex_warn "systemctl не найден. Юниты записаны в $(dirname "$unit"), но не включены."
     return 0
   fi
   systemctl daemon-reload
   systemctl enable multi-exit-relay.service
-  mex_info "Служба multi-exit-relay.service включена и повторно применит правила при загрузке."
+  systemctl enable --now multi-exit-relay-resolve.timer
+  mex_info "Служба multi-exit-relay.service включена. Таймер multi-exit-relay-resolve.timer каждые 5 минут заново разрешает имена Exit и сверяет правила."
 }
 
 mex_remove_systemd() {
   [[ "${MEX_SKIP_SYSTEMD:-0}" == "1" ]] && return 0
+  mex_systemd_paths
   if [[ "${MEX_DRY_RUN:-0}" != "1" ]] && mex_have systemctl; then
+    systemctl disable --now multi-exit-relay-resolve.timer >/dev/null 2>&1 || true
+    systemctl disable --now multi-exit-relay-resolve.service >/dev/null 2>&1 || true
     systemctl disable --now multi-exit-relay.service >/dev/null 2>&1 || true
-    rm -f "$MEX_SYSTEMD_UNIT"
+    rm -f "$MEX_SYSTEMD_UNIT" "$MEX_SYSTEMD_RESOLVE_SERVICE" "$MEX_SYSTEMD_RESOLVE_TIMER"
     systemctl daemon-reload >/dev/null 2>&1 || true
   else
-    rm -f "$MEX_SYSTEMD_UNIT"
+    rm -f "$MEX_SYSTEMD_UNIT" "$MEX_SYSTEMD_RESOLVE_SERVICE" "$MEX_SYSTEMD_RESOLVE_TIMER"
   fi
-  mex_info "Служба multi-exit-relay отключена."
+  mex_info "Служба multi-exit-relay и таймер резолва отключены."
 }
 
 mex_sync_install_tree() {
@@ -547,17 +605,172 @@ mex_netfilter_save() {
   return 0
 }
 
-mex_apply_from_config() {
-  mex_require_root || return 1
-  mex_acquire_lock || return 1
-  if [[ ! -f "$MEX_CONFIG_FILE" ]]; then
-    mex_info "Конфигурация отсутствует, применять нечего."
+mex_apply_install_config_file() {
+  local src="$1"
+  local ver tmp
+  [[ -n "$src" ]] || return 0
+  if [[ ! -f "$src" ]]; then
+    mex_json_error 2 config_missing "Файл конфигурации не найден: ${src}" || return $?
+  fi
+  if ! jq -e . "$src" >/dev/null 2>&1; then
+    mex_json_error 2 config_invalid "Файл ${src} не является JSON. Текущая конфигурация не заменена." || return $?
+  fi
+  ver="$(jq -r '.version // empty' "$src" 2>/dev/null || true)"
+  case "$ver" in
+    1|2) ;;
+    *)
+      mex_json_error 2 config_invalid "В ${src} неподдерживаемая версия схемы. Текущая конфигурация не заменена." || return $?
+      ;;
+  esac
+  if ! mex_config_validate_file "$src"; then
+    local err="${MEX_CONFIG_ERROR:-config_invalid}"
+    mex_json_error 2 "$err" "Файл ${src} не прошёл проверку. Текущая конфигурация не заменена." || return $?
+  fi
+  mex_ensure_dirs
+  if [[ -f "$MEX_CONFIG_FILE" ]] && [[ "$(readlink -f "$src")" == "$(readlink -f "$MEX_CONFIG_FILE")" ]]; then
     return 0
   fi
-  mex_ensure_sysctl || return 1
-  mex_iptables_apply_config || return 1
+  tmp="$(mktemp)"
+  cp -a "$src" "$tmp"
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$MEX_CONFIG_FILE"
+  return 0
+}
+
+mex_apply_emit_json() {
+  [[ "${MEX_JSON:-0}" == "1" ]] || return 0
+  local exits forwards
+  exits="$(jq -r '.exits | length' "$MEX_CONFIG_FILE")"
+  forwards="$(jq -r '[.exits[].forwards[]?] | length' "$MEX_CONFIG_FILE")"
+  jq -n \
+    --arg version "$MEX_VERSION" \
+    --arg config_file "$MEX_CONFIG_FILE" \
+    --argjson config_version 2 \
+    --argjson exits "$exits" \
+    --argjson forwards "$forwards" \
+    --argjson added "${MEX_RULES_ADDED:-0}" \
+    --argjson removed "${MEX_RULES_REMOVED:-0}" \
+    --argjson unchanged "${MEX_RULES_UNCHANGED:-0}" \
+    '{
+      ok: true,
+      command: "apply",
+      version: $version,
+      config_file: $config_file,
+      config_version: $config_version,
+      exits: $exits,
+      forwards: $forwards,
+      rules_added: $added,
+      rules_removed: $removed,
+      rules_unchanged: $unchanged
+    }'
+}
+
+mex_apply_from_config() {
+  local rc=0
+  MEX_INFO_STDERR=1
+  if [[ "${MEX_OPT_JSON:-0}" == "1" ]]; then
+    MEX_JSON=1
+    MEX_JSON_COMMAND="apply"
+  fi
+  mex_require_root || {
+    mex_json_error 3 permission "Нужны права root." || return $?
+  }
+  if ! mex_acquire_lock; then
+    if [[ "${MEX_JSON:-0}" == "1" ]] && command -v jq >/dev/null 2>&1; then
+      jq -n \
+        --arg version "$MEX_VERSION" \
+        --arg config_file "${MEX_CONFIG_FILE:-}" \
+        '{
+          ok: false,
+          command: "apply",
+          error: "lock_busy",
+          message: "Уже выполняется другой экземпляр Multi-Exit Relay.",
+          version: $version,
+          config_file: $config_file,
+          problems: [{code: "lock_busy"}]
+        }'
+    fi
+    return 5
+  fi
+  if [[ -n "${MEX_OPT_CONFIG:-}" ]]; then
+    mex_apply_install_config_file "$MEX_OPT_CONFIG" || return $?
+  fi
+  if [[ ! -f "$MEX_CONFIG_FILE" ]]; then
+    mex_json_error 2 config_missing "Конфигурация отсутствует: ${MEX_CONFIG_FILE}" || return $?
+  fi
+  if ! mex_ensure_sysctl; then
+    mex_json_error 3 apply_failed "Не удалось включить net.ipv4.ip_forward." || return $?
+  fi
+  mex_iptables_apply_config || rc=$?
+  if (( rc != 0 )); then
+    return "$rc"
+  fi
   mex_netfilter_save || true
+  mex_apply_emit_json
   mex_info "Правила применены из ${MEX_CONFIG_FILE}."
+  return 0
+}
+
+mex_install_packages_noninteractive() {
+  [[ "${MEX_SKIP_DEPS:-0}" == "1" || "${MEX_DRY_RUN:-0}" == "1" ]] && return 0
+  if ! mex_have apt-get; then
+    mex_json_error 3 dependency "Нужен apt-get (Ubuntu 22.04 или 24.04)." || return $?
+  fi
+  export DEBIAN_FRONTEND=noninteractive
+  echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
+  echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections
+  if ! apt-get update -y; then
+    mex_json_error 3 dependency "apt-get update завершился с ошибкой." || return $?
+  fi
+  if ! apt-get install -y jq iptables iproute2 curl ca-certificates iptables-persistent coreutils util-linux procps; then
+    mex_json_error 3 dependency "Не удалось установить пакеты Multi-Exit Relay." || return $?
+  fi
+  return 0
+}
+
+mex_install_noninteractive() {
+  local n=0
+  mex_require_root || {
+    mex_json_error 3 permission "Нужны права root." || return $?
+  }
+  if ! mex_os_is_supported; then
+    mex_json_error 3 unsupported_os "Нужна Ubuntu 22.04 или 24.04." || return $?
+  fi
+  mex_install_packages_noninteractive || return $?
+  mex_require_iptables || {
+    mex_json_error 3 dependency "Команда iptables недоступна." || return $?
+  }
+  mex_acquire_lock || return $?
+  mex_ensure_dirs
+  if [[ -f "$MEX_CONFIG_FILE" ]]; then
+    if ! mex_config_validate_file "$MEX_CONFIG_FILE"; then
+      mex_json_error 2 config_invalid "Существующий ${MEX_CONFIG_FILE} повреждён. Файл не перезаписан." || return $?
+    fi
+    if [[ "$(jq -r '.version // empty' "$MEX_CONFIG_FILE")" == "1" ]]; then
+      if ! mex_config_migrate_inplace "$MEX_CONFIG_FILE"; then
+        mex_json_error 2 config_invalid "Не удалось перевести существующий config.json на схему v2." || return $?
+      fi
+    fi
+  else
+    if [[ -z "${MEX_EGRESS_IFACE:-}" ]]; then
+      MEX_EGRESS_IFACE="$(mex_detect_egress_iface 2>/dev/null || true)"
+    fi
+    if [[ -z "${MEX_PUBLIC_IP:-}" ]]; then
+      MEX_PUBLIC_IP="$(mex_detect_public_ip 2>/dev/null || true)"
+    fi
+    mex_config_ensure || {
+      mex_json_error 3 apply_failed "Не удалось создать ${MEX_CONFIG_FILE}." || return $?
+    }
+  fi
+  mex_install_host_integration || {
+    mex_json_error 3 apply_failed "Не удалось установить службу и команду relay." || return $?
+  }
+  n="$(jq -r '[.exits[]?.forwards[]?] | length' "$MEX_CONFIG_FILE" 2>/dev/null || printf '0')"
+  if [[ "$n" =~ ^[0-9]+$ ]] && (( n > 0 )); then
+    mex_apply_from_config || return $?
+  fi
+  mex_info "Установка без вопросов завершена. Команда: relay. Конфигурация: ${MEX_CONFIG_FILE}."
+  return 0
 }
 
 mex_show_firewall_summary() {

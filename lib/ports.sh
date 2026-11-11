@@ -122,6 +122,10 @@ mex_ports_scan_dnat() {
   fi
   while IFS= read -r line; do
     [[ "$line" == *"-j DNAT"* || "$line" == *"-j REDIRECT"* ]] || continue
+    # Автоподбор пар — только TCP. Чужой UDP DNAT не занимает TCP-порт.
+    if [[ "$line" == *"-p udp"* ]]; then
+      continue
+    fi
     if [[ "$line" =~ --dport[[:space:]]+([0-9]+) ]]; then
       mex_ports_mark "${BASH_REMATCH[1]}"
     fi
@@ -143,7 +147,13 @@ mex_ports_scan_config() {
   while IFS= read -r p; do
     [[ -n "$p" && "$p" != "null" ]] || continue
     mex_ports_mark "$p"
-  done < <(jq -r '.exits[]? | .relay_port_443, .relay_port_8443' "$file" 2>/dev/null || true)
+  done < <(jq -r '
+    if .version == 1 then
+      .exits[]? | .relay_port_443, .relay_port_8443
+    else
+      .exits[]?.forwards[]? | select(.proto == "tcp") | .listen
+    end
+  ' "$file" 2>/dev/null || true)
 }
 
 mex_ports_collect_all() {
